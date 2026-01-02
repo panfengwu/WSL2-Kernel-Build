@@ -18,8 +18,6 @@ on:
   schedule:
     # 每周一 00:00 UTC 自动运行
     - cron: '0 0 * * 1'
-  repository_dispatch:
-    types: [build-kernel]
 
 env:
   WORKSPACE: ${{ github.workspace }}
@@ -635,7 +633,7 @@ echo ""
 echo "Troubleshooting:"
 echo "- If WSL doesn't start: check .wslconfig syntax"
 echo "- If binder not found: ensure kernel has binder support"
-echo "- For Waydroid issues: check systemd and user namespaces"
+echo "- For Waydroid issues: check systemd and user namespaces
 echo "========================================"
 EOF
         
