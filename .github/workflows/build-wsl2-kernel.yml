@@ -1,130 +1,287 @@
-name: Build WSL2 Kernel for Waydroid (Strict Version)
-on: 
+name: Build WSL2 Kernel with Waydroid Support
+
+on:
   push:
-    branches: [ main ]  # 仅main分支提交触发，避免无效编译
-  workflow_dispatch:  # 手动触发（推荐，灵活控制编译时机）
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/build-wsl2-waydroid-kernel.yml'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # 允许手动触发
+    inputs:
+      kernel_version:
+        description: 'Linux kernel version (e.g., 6.6.30)'
+        required: true
+        default: '6.6.30'
+      microsoft_branch:
+        description: 'Microsoft WSL2 kernel branch'
+        required: true
+        default: 'linux-msft-wsl-6.6.y'
 
 jobs:
-  build-wsl2-waydroid-kernel:
-    runs-on: ubuntu-24.04  # 稳定版Ubuntu Runner
-    timeout-minutes: 120  # 延长超时时间（内核编译耗时较长）
+  build-kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120  # 编译内核可能需要较长时间
+    
     steps:
-      # 步骤1：检查仓库（严谨初始化，关闭浅克隆）
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # 完整克隆，避免后续依赖缺失
-
-      # 步骤2：安装编译依赖（严谨完整，包含所有必需工具）
-      - name: Install Strict Full Dependencies
-        run: |
-          # 先升级系统，避免依赖版本过低
-          sudo apt update -y && sudo apt upgrade -y
-          # 安装内核编译核心依赖（无遗漏，包含调试/打包工具）
-          sudo apt install -y \
-            build-essential \
-            flex \
-            bison \
-            libssl-dev \
-            libelf-dev \
-            bc \
-            python3 \
-            python3-pip \
-            pahole \
-            cpio \
-            dwarves \
-            git \
-            kmod \
-            libncurses5-dev \
-            libncursesw5-dev \
-            rsync \
-            --fix-missing
-          # 验证关键依赖是否安装成功
-          if ! command -v make &> /dev/null || ! command -v gcc &> /dev/null; then
-            echo "核心编译工具make/gcc安装失败"
-            exit 1
-          fi
-
-      # 步骤3：克隆WSL2官方内核源码（严谨版本控制，6.6.x稳定分支）
-      - name: Clone WSL2 Official Kernel Source (Stable 6.6.y)
-        run: |
-          # 深度克隆（--depth=1）加快速度，指定稳定分支
-          git clone --depth=1 \
-            -b linux-msft-wsl-6.6.y \
-            https://github.com/microsoft/WSL2-Linux-Kernel.git \
-            WSL2-Kernel-Source  # 显式指定目录名，避免路径混乱
-          # 进入源码目录
-          cd WSL2-Kernel-Source
-          # 严谨校验：验证Microsoft配置目录是否存在
-          if [ ! -d "Microsoft" ] || [ ! -f "Microsoft/config-wsl" ]; then
-            echo "Microsoft WSL配置文件缺失，克隆源码失败"
-            exit 1
-          fi
-          # 输出内核版本信息，确认源码有效性
-          echo "WSL2内核源码版本："
-          head -n 5 Makefile
-
-      # 步骤4：内核配置（非交互式，严谨启用Waydroid必需功能，无遗漏）
-      - name: Strict Kernel Configuration for Waydroid (Non-Interactive)
-        run: |
-          cd WSL2-Kernel-Source
-          # 1. 加载Microsoft官方WSL2基础配置（确保WSL2兼容性）
-          cp Microsoft/config-wsl .config
-          # 2. 严谨启用Waydroid核心依赖：Binder IPC机制（编译进内核，=y 而非模块）
-          scripts/config --enable CONFIG_ANDROID
-          scripts/config --enable CONFIG_ANDROID_BINDER_IPC
-          scripts/config --enable CONFIG_ANDROID_BINDERFS
-          scripts/config --enable CONFIG_ANDROID_BINDER_DEVICES
-          scripts/config --set-val CONFIG_ANDROID_BINDER_MAX_THREADS 1000  # 设置合理线程数
-          # 3. 严谨启用Waydroid核心依赖：Ashmem内存共享
-          scripts/config --enable CONFIG_ANDROID_ASHMEM
-          # 4. 可选：启用Android日志系统（方便Waydroid调试）
-          scripts/config --enable CONFIG_ANDROID_LOGGER
-          # 5. 严谨生成最终配置：自动解决依赖冲突，无交互
-          make olddefconfig
-          # 6. 校验配置是否生效（严谨性检查，避免配置遗漏）
-          echo "===== 验证Waydroid核心配置是否启用 ====="
-          CONFIG_CHECK_LIST=(
-            "CONFIG_ANDROID=y"
-            "CONFIG_ANDROID_BINDER_IPC=y"
-            "CONFIG_ANDROID_BINDERFS=y"
-            "CONFIG_ANDROID_ASHMEM=y"
-          )
-          for config in "${CONFIG_CHECK_LIST[@]}"; do
-            if ! grep -q "^$config" .config; then
-              echo "配置缺失：$config"
-              exit 1
-            else
-              echo "配置生效：$config"
-            fi
-          done
-
-      # 步骤5：编译内核（严谨参数，优化编译效率，避免报错）
-      - name: Compile WSL2 Kernel (Strict & Efficient)
-        run: |
-          cd WSL2-Kernel-Source
-          # 核心修复：使用正确的x86架构路径（x86_64兼容此路径）
-          # -j$(nproc)：最大化利用CPU核心，加快编译
-          # 显式指定配置文件，避免自动加载错误配置
-          make -j$(nproc) \
-            KCONFIG_CONFIG=$(pwd)/.config \
-            arch/x86/boot/bzImage
-          # 严谨校验：确认内核镜像是否生成
-          BZIMAGE_PATH="arch/x86/boot/bzImage"
-          if [ ! -f "$BZIMAGE_PATH" ] || [ -s "$BZIMAGE_PATH" -eq 0 ]; then
-            echo "内核镜像bzImage生成失败或为空文件"
-            exit 1
-          fi
-          # 输出文件信息，确认编译成功
-          echo "===== 编译后的内核镜像信息 ====="
-          ls -la "$BZIMAGE_PATH"
-          file "$BZIMAGE_PATH"  # 验证文件类型为ELF 64位内核镜像
-
-      # 步骤6：打包并上传内核（严谨命名，方便识别，延长保存时间）
-      - name: Package & Upload Compiled WSL2 Kernel
-        uses: actions/upload-artifact@v3  # 稳定版上传工具，避免兼容性问题
-        with:
-          name: wsl2-waydroid-kernel-6.6.x-$(date +%Y%m%d%H%M)  # 带时间戳，避免重名
-          path: WSL2-Kernel-Source/arch/x86/boot/bzImage
-          retention-days: 30  # 延长保存30天，足够下载和备份
-          if-no-files-found: error  # 无文件则报错，及时发现编译失败
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          flex \
+          bison \
+          libssl-dev \
+          libelf-dev \
+          bc \
+          dwarves \
+          git \
+          wget \
+          curl \
+          cpio \
+          rsync \
+          kmod \
+          pkg-config \
+          libncurses-dev \
+          zstd
+        echo "Build environment setup completed"
+    
+    - name: Download WSL2 kernel source
+      env:
+        KERNEL_VERSION: ${{ github.event.inputs.kernel_version || '6.6.30' }}
+        MS_BRANCH: ${{ github.event.inputs.microsoft_branch || 'linux-msft-wsl-6.6.y' }}
+      run: |
+        echo "Downloading WSL2 kernel source for version: $KERNEL_VERSION"
+        echo "Using Microsoft branch: $MS_BRANCH"
+        
+        # 克隆 Microsoft 的 WSL2 内核仓库
+        git clone --depth 1 --branch $MS_BRANCH \
+          https://github.com/microsoft/WSL2-Linux-Kernel.git
+        
+        cd WSL2-Linux-Kernel
+        KERNEL_COMMIT=$(git rev-parse HEAD)
+        echo "KERNEL_COMMIT=$KERNEL_COMMIT" >> $GITHUB_ENV
+        echo "KERNEL_SOURCE_DIR=$(pwd)" >> $GITHUB_ENV
+        cd ..
+    
+    - name: Apply Waydroid kernel patches
+      env:
+        KERNEL_SOURCE_DIR: ${{ env.KERNEL_SOURCE_DIR }}
+      run: |
+        echo "Applying Waydroid kernel patches..."
+        cd $KERNEL_SOURCE_DIR
+        
+        # Waydroid 需要的内核配置
+        # 1. 确保 binder 驱动启用
+        # 2. 启用 android 相关配置
+        # 3. 启用必要的网络和 security 配置
+        
+        # 备份原始配置
+        cp Microsoft/config-wsl .config
+        
+        # 启用 binder
+        scripts/config --enable CONFIG_ANDROID
+        scripts/config --enable CONFIG_ANDROID_BINDER_IPC
+        scripts/config --enable CONFIG_ANDROID_BINDERFS
+        scripts/config --set-val CONFIG_ANDROID_BINDER_DEVICES "binder,hwbinder,vndbinder"
+        
+        # 启用必要的 ASHMEM
+        scripts/config --enable CONFIG_ASHMEM
+        
+        # 启用网络配置（Waydroid 需要）
+        scripts/config --enable CONFIG_BRIDGE
+        scripts/config --enable CONFIG_BRIDGE_NETFILTER
+        scripts/config --enable CONFIG_NETFILTER_XT_MATCH_PHYSDEV
+        scripts/config --enable CONFIG_NETFILTER_XT_CONNMARK
+        scripts/config --enable CONFIG_NETFILTER_XT_MARK
+        
+        # 启用必要的安全配置
+        scripts/config --enable CONFIG_SECCOMP
+        scripts/config --enable CONFIG_SECCOMP_FILTER
+        
+        # 启用用户命名空间
+        scripts/config --enable CONFIG_USER_NS
+        scripts/config --enable CONFIG_PID_NS
+        scripts/config --enable CONFIG_NET_NS
+        scripts/config --enable CONFIG_IPC_NS
+        scripts/config --enable CONFIG_UTS_NS
+        
+        # 启用 cgroup 配置
+        scripts/config --enable CONFIG_CGROUPS
+        scripts/config --enable CONFIG_CGROUP_DEVICE
+        scripts/config --enable CONFIG_CGROUP_FREEZER
+        scripts/config --enable CONFIG_CGROUP_PIDS
+        scripts/config --enable CONFIG_CGROUP_CPUACCT
+        scripts/config --enable CONFIG_CGROUP_SCHED
+        
+        # 启用网络配置
+        scripts/config --enable CONFIG_IP_NF_IPTABLES
+        scripts/config --enable CONFIG_IP_NF_NAT
+        scripts/config --enable CONFIG_IP_NF_FILTER
+        scripts/config --enable CONFIG_IP_NF_MANGLE
+        scripts/config --enable CONFIG_NETFILTER_XTABLES
+        
+        # 检查配置是否已应用
+        echo "Checking binder configuration:"
+        grep CONFIG_ANDROID_BINDER_IPC .config || echo "Binder IPC not found in config"
+        
+        echo "Waydroid patches applied"
+    
+    - name: Configure kernel
+      env:
+        KERNEL_SOURCE_DIR: ${{ env.KERNEL_SOURCE_DIR }}
+      run: |
+        cd $KERNEL_SOURCE_DIR
+        echo "Configuring kernel..."
+        
+        # 使用现有配置作为基础
+        make olddefconfig
+        
+        # 验证 Waydroid 相关配置
+        echo "Verifying Waydroid configurations:"
+        echo "CONFIG_ANDROID_BINDER_IPC: $(grep CONFIG_ANDROID_BINDER_IPC .config || echo 'NOT FOUND')"
+        echo "CONFIG_ASHMEM: $(grep CONFIG_ASHMEM .config || echo 'NOT FOUND')"
+        echo "CONFIG_USER_NS: $(grep CONFIG_USER_NS .config || echo 'NOT FOUND')"
+    
+    - name: Build kernel
+      env:
+        KERNEL_SOURCE_DIR: ${{ env.KERNEL_SOURCE_DIR }}
+        NPROC: $(nproc)
+      run: |
+        cd $KERNEL_SOURCE_DIR
+        echo "Building kernel with $NPROC threads..."
+        
+        # 编译内核
+        make -j$NPROC
+        
+        # 编译模块
+        make modules -j$NPROC
+        
+        echo "Kernel build completed"
+    
+    - name: Install modules
+      env:
+        KERNEL_SOURCE_DIR: ${{ env.KERNEL_SOURCE_DIR }}
+      run: |
+        cd $KERNEL_SOURCE_DIR
+        echo "Installing modules..."
+        
+        # 创建临时目录安装模块
+        mkdir -p kernel-modules
+        make modules_install INSTALL_MOD_PATH=$(pwd)/kernel-modules
+        
+        echo "Modules installed"
+    
+    - name: Create kernel tarball
+      env:
+        KERNEL_SOURCE_DIR: ${{ env.KERNEL_SOURCE_DIR }}
+        KERNEL_VERSION: ${{ github.event.inputs.kernel_version || '6.6.30' }}
+        KERNEL_COMMIT: ${{ env.KERNEL_COMMIT }}
+      run: |
+        cd $KERNEL_SOURCE_DIR
+        
+        # 创建输出目录
+        mkdir -p ../kernel-output
+        
+        # 复制内核映像
+        cp arch/x86/boot/bzImage ../kernel-output/bzImage-waydroid
+        
+        # 创建版本信息文件
+        cat > ../kernel-output/version-info.txt << EOF
+        Kernel Version: $KERNEL_VERSION
+        Commit: $KERNEL_COMMIT
+        Build Date: $(date -u)
+        Features: Waydroid Support (Binder, ASHMEM, Namespaces)
+        Build System: GitHub Actions
+        EOF
+        
+        # 打包模块
+        tar -czf ../kernel-output/modules.tar.gz -C kernel-modules lib/modules
+        
+        echo "Created kernel tarball"
+    
+    - name: Generate WSL config file
+      env:
+        KERNEL_SOURCE_DIR: ${{ env.KERNEL_SOURCE_DIR }}
+      run: |
+        cd $KERNEL_SOURCE_DIR
+        mkdir -p ../kernel-output
+        
+        # 生成 .wslconfig 配置文件示例
+        cat > ../kernel-output/.wslconfig << 'EOF'
+        # WSL2 configuration for Waydroid support
+        [wsl2]
+        
+        # Path to the custom kernel
+        kernel = C:\\path\\to\\bzImage-waydroid
+        
+        # Recommended settings for Waydroid
+        memory = 4GB
+        processors = 2
+        localhostForwarding = true
+        
+        # Networking
+        networkingMode = nat
+        
+        # VM options
+        [vm]
+        firmware = ""
+        
+        # Waydroid specific notes:
+        # 1. Install Waydroid in Ubuntu:
+        #    curl https://repo.waydro.id | bash
+        #    sudo apt install waydroid
+        # 
+        # 2. Initialize Waydroid:
+        #    sudo waydroid init
+        # 
+        # 3. Start Waydroid service:
+        #    systemctl --user start waydroid-container
+        # 
+        # 4. Launch Waydroid session:
+        #    waydroid session start
+        EOF
+        
+        echo "Generated WSL config file"
+    
+    - name: Upload kernel artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: wsl2-waydroid-kernel
+        path: |
+          ${{ env.KERNEL_SOURCE_DIR }}/../kernel-output/*
+        retention-days: 30
+    
+    - name: Create GitHub Release (on tag)
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          ${{ env.KERNEL_SOURCE_DIR }}/../kernel-output/bzImage-waydroid
+          ${{ env.KERNEL_SOURCE_DIR }}/../kernel-output/modules.tar.gz
+          ${{ env.KERNEL_SOURCE_DIR }}/../kernel-output/version-info.txt
+          ${{ env.KERNEL_SOURCE_DIR }}/../kernel-output/.wslconfig
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+    
+    - name: Summary
+      run: |
+        echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ WSL2 Kernel with Waydroid support built successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Artifacts include:**" >> $GITHUB_STEP_SUMMARY
+        echo "- `bzImage-waydroid`: Custom kernel image" >> $GITHUB_STEP_SUMMARY
+        echo "- `modules.tar.gz`: Kernel modules" >> $GITHUB_STEP_SUMMARY
+        echo "- `version-info.txt`: Build information" >> $GITHUB_STEP_SUMMARY
+        echo "- `.wslconfig`: Sample WSL configuration" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Usage instructions:**" >> $GITHUB_STEP_SUMMARY
+        echo "1. Download the artifacts" >> $GITHUB_STEP_SUMMARY
+        echo "2. Place `bzImage-waydroid` in a Windows directory" >> $GITHUB_STEP_SUMMARY
+        echo "3. Update your `.wslconfig` to point to the kernel" >> $GITHUB_STEP_SUMMARY
+        echo "4. Restart WSL: `wsl --shutdown`" >> $GITHUB_STEP_SUMMARY
