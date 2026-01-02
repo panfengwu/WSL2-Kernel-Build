@@ -386,8 +386,8 @@ jobs:
           echo "❌ Kernel build failed!"
           echo "KERNEL_BUILD_STATUS=failed" >> $GITHUB_ENV
           echo "Build log tail:"
-          tail -50 build.log
-          exit 1
+            tail -50 build.log
+            exit 1
         fi
         
         echo "Build logs:"
@@ -469,7 +469,7 @@ jobs:
         echo "Kernel copied: $OUTPUT_DIR/$KERNEL_FILE"
         
         # 创建版本信息文件
-        cat > "$OUTPUT_DIR/version-info.txt" << EOF
+        cat > "$OUTPUT_DIR/version-info.txt" << 'EOF'
 ========================================
 WSL2 Kernel with Waydroid Support
 ========================================
@@ -500,10 +500,10 @@ Features Enabled:
 Installation:
 -------------
 1. Copy '$KERNEL_FILE' to a Windows directory
-2. Update your '%USERPROFILE%\\.wslconfig' file:
+2. Update your '%USERPROFILE%\.wslconfig' file:
 
    [wsl2]
-   kernel=C:\\path\\to\\$KERNEL_FILE
+   kernel=C:\path\to\$KERNEL_FILE
    memory=4GB
    processors=2
 
@@ -525,9 +525,9 @@ EOF
         echo "Version info created: $OUTPUT_DIR/version-info.txt"
         
         # 生成 .wslconfig
-        cat > "$OUTPUT_DIR/.wslconfig" << EOF
+        cat > "$OUTPUT_DIR/.wslconfig" << 'EOF'
 [wsl2]
-kernel=C:\\Users\\YourUsername\\wsl2-kernel\\$KERNEL_FILE
+kernel=C:\Users\YourUsername\wsl2-kernel\$KERNEL_FILE
 memory=4GB
 processors=2
 localhostForwarding=true
@@ -633,7 +633,7 @@ echo ""
 echo "Troubleshooting:"
 echo "- If WSL doesn't start: check .wslconfig syntax"
 echo "- If binder not found: ensure kernel has binder support"
-echo "- For Waydroid issues: check systemd and user namespaces
+echo "- For Waydroid issues: check systemd and user namespaces"
 echo "========================================"
 EOF
         
