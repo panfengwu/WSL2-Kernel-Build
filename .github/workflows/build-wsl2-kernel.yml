@@ -11,7 +11,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v2
@@ -39,7 +39,7 @@ jobs:
         make -j$(nproc)
 
     - name: Upload the compiled kernel
-      uses: actions/upload-artifact@v3.1  # 使用 v3.1 版本（最新稳定版）
+      uses: actions/upload-artifact@v3.2  # 使用 v3.2 版本
       with:
         name: bzImage
         path: WSL2-Linux-Kernel/arch/x86/boot/bzImage
