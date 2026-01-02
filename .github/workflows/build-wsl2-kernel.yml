@@ -1,4 +1,4 @@
-name: Build WSL2 Kernel with Waydroid Support
+name: build-wsl2-kernel.yml
 
 on:
   push:
