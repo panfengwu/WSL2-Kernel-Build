@@ -1,60 +1,130 @@
-name: Build WSL2 Kernel for Waydroid
+name: Build WSL2 Kernel for Waydroid (Strict Version)
 on: 
-  push:  # 提交文件自动触发编译
-  workflow_dispatch:  # 手动触发编译（更灵活，推荐）
+  push:
+    branches: [ main ]  # 仅main分支提交触发，避免无效编译
+  workflow_dispatch:  # 手动触发（推荐，灵活控制编译时机）
 
 jobs:
-  build-kernel:
-    runs-on: ubuntu-24.04
+  build-wsl2-waydroid-kernel:
+    runs-on: ubuntu-24.04  # 稳定版Ubuntu Runner
+    timeout-minutes: 120  # 延长超时时间（内核编译耗时较长）
     steps:
-      # 步骤1：检查仓库（必填，初始化环境）
+      # 步骤1：检查仓库（严谨初始化，关闭浅克隆）
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 完整克隆，避免后续依赖缺失
 
-      # 步骤2：安装所有编译依赖（完整无遗漏）
-      - name: Install Full Dependencies
+      # 步骤2：安装编译依赖（严谨完整，包含所有必需工具）
+      - name: Install Strict Full Dependencies
         run: |
-          sudo apt update -y
-          sudo apt install -y build-essential flex bison libssl-dev libelf-dev bc python3 pahole cpio dwarves git --fix-missing
+          # 先升级系统，避免依赖版本过低
+          sudo apt update -y && sudo apt upgrade -y
+          # 安装内核编译核心依赖（无遗漏，包含调试/打包工具）
+          sudo apt install -y \
+            build-essential \
+            flex \
+            bison \
+            libssl-dev \
+            libelf-dev \
+            bc \
+            python3 \
+            python3-pip \
+            pahole \
+            cpio \
+            dwarves \
+            git \
+            kmod \
+            libncurses5-dev \
+            libncursesw5-dev \
+            rsync \
+            --fix-missing
+          # 验证关键依赖是否安装成功
+          if ! command -v make &> /dev/null || ! command -v gcc &> /dev/null; then
+            echo "核心编译工具make/gcc安装失败"
+            exit 1
+          fi
 
-      # 步骤3：克隆WSL2内核源码（6.6.x稳定版，深度克隆加快速度）
-      - name: Clone WSL2 Kernel Source Code
+      # 步骤3：克隆WSL2官方内核源码（严谨版本控制，6.6.x稳定分支）
+      - name: Clone WSL2 Official Kernel Source (Stable 6.6.y)
         run: |
-          git clone --depth=1 -b linux-msft-wsl-6.6.y https://github.com/microsoft/WSL2-Linux-Kernel.git
-          cd WSL2-Linux-Kernel
-          # 验证Microsoft目录是否存在（容错检查）
-          ls -la Microsoft/
+          # 深度克隆（--depth=1）加快速度，指定稳定分支
+          git clone --depth=1 \
+            -b linux-msft-wsl-6.6.y \
+            https://github.com/microsoft/WSL2-Linux-Kernel.git \
+            WSL2-Kernel-Source  # 显式指定目录名，避免路径混乱
+          # 进入源码目录
+          cd WSL2-Kernel-Source
+          # 严谨校验：验证Microsoft配置目录是否存在
+          if [ ! -d "Microsoft" ] || [ ! -f "Microsoft/config-wsl" ]; then
+            echo "Microsoft WSL配置文件缺失，克隆源码失败"
+            exit 1
+          fi
+          # 输出内核版本信息，确认源码有效性
+          echo "WSL2内核源码版本："
+          head -n 5 Makefile
 
-      # 步骤4：配置内核（非交互式，直接启用Binder/Ashmem，替代make menuconfig）
-      - name: Configure Kernel for Android Support (Non-interactive)
+      # 步骤4：内核配置（非交互式，严谨启用Waydroid必需功能，无遗漏）
+      - name: Strict Kernel Configuration for Waydroid (Non-Interactive)
         run: |
-          cd WSL2-Linux-Kernel
-          # 1. 先加载Microsoft官方WSL配置文件（基础配置）
+          cd WSL2-Kernel-Source
+          # 1. 加载Microsoft官方WSL2基础配置（确保WSL2兼容性）
           cp Microsoft/config-wsl .config
-          # 2. 非交互式启用Binder IPC（核心：=y 表示编译进内核，不是模块）
-          # Binder核心功能
+          # 2. 严谨启用Waydroid核心依赖：Binder IPC机制（编译进内核，=y 而非模块）
           scripts/config --enable CONFIG_ANDROID
           scripts/config --enable CONFIG_ANDROID_BINDER_IPC
           scripts/config --enable CONFIG_ANDROID_BINDERFS
           scripts/config --enable CONFIG_ANDROID_BINDER_DEVICES
-          # 3. 非交互式启用Ashmem（Android内存共享）
+          scripts/config --set-val CONFIG_ANDROID_BINDER_MAX_THREADS 1000  # 设置合理线程数
+          # 3. 严谨启用Waydroid核心依赖：Ashmem内存共享
           scripts/config --enable CONFIG_ANDROID_ASHMEM
-          # 4. 生成最终配置文件（自动解决依赖冲突）
+          # 4. 可选：启用Android日志系统（方便Waydroid调试）
+          scripts/config --enable CONFIG_ANDROID_LOGGER
+          # 5. 严谨生成最终配置：自动解决依赖冲突，无交互
           make olddefconfig
+          # 6. 校验配置是否生效（严谨性检查，避免配置遗漏）
+          echo "===== 验证Waydroid核心配置是否启用 ====="
+          CONFIG_CHECK_LIST=(
+            "CONFIG_ANDROID=y"
+            "CONFIG_ANDROID_BINDER_IPC=y"
+            "CONFIG_ANDROID_BINDERFS=y"
+            "CONFIG_ANDROID_ASHMEM=y"
+          )
+          for config in "${CONFIG_CHECK_LIST[@]}"; do
+            if ! grep -q "^$config" .config; then
+              echo "配置缺失：$config"
+              exit 1
+            else
+              echo "配置生效：$config"
+            fi
+          done
 
-      # 步骤5：编译内核（修复路径错误，优化配置传递）
-      - name: Compile WSL2 Kernel (Enable Binder/Ashmem)
+      # 步骤5：编译内核（严谨参数，优化编译效率，避免报错）
+      - name: Compile WSL2 Kernel (Strict & Efficient)
         run: |
-          cd WSL2-Linux-Kernel
-          # 关键修复：使用正确的x86架构编译路径，移除冗余的KCONFIG_CONFIG指定
-          make -j$(nproc) arch/x86/boot/bzImage
-          # 验证：同步使用正确路径检查bzImage是否生成
-          ls -la arch/x86/boot/bzImage
+          cd WSL2-Kernel-Source
+          # 核心修复：使用正确的x86架构路径（x86_64兼容此路径）
+          # -j$(nproc)：最大化利用CPU核心，加快编译
+          # 显式指定配置文件，避免自动加载错误配置
+          make -j$(nproc) \
+            KCONFIG_CONFIG=$(pwd)/.config \
+            arch/x86/boot/bzImage
+          # 严谨校验：确认内核镜像是否生成
+          BZIMAGE_PATH="arch/x86/boot/bzImage"
+          if [ ! -f "$BZIMAGE_PATH" ] || [ -s "$BZIMAGE_PATH" -eq 0 ]; then
+            echo "内核镜像bzImage生成失败或为空文件"
+            exit 1
+          fi
+          # 输出文件信息，确认编译成功
+          echo "===== 编译后的内核镜像信息 ====="
+          ls -la "$BZIMAGE_PATH"
+          file "$BZIMAGE_PATH"  # 验证文件类型为ELF 64位内核镜像
 
-      # 步骤6：上传编译好的内核文件（同步更新文件路径，确保上传成功）
-      - name: Upload Compiled bzImage
-        uses: actions/upload-artifact@v3
+      # 步骤6：打包并上传内核（严谨命名，方便识别，延长保存时间）
+      - name: Package & Upload Compiled WSL2 Kernel
+        uses: actions/upload-artifact@v3  # 稳定版上传工具，避免兼容性问题
         with:
-          name: wsl2-waydroid-kernel
-          path: WSL2-Linux-Kernel/arch/x86/boot/bzImage  # 同步更新为正确路径
-          retention-days: 7  # 文件保存7天，足够下载
+          name: wsl2-waydroid-kernel-6.6.x-$(date +%Y%m%d%H%M)  # 带时间戳，避免重名
+          path: WSL2-Kernel-Source/arch/x86/boot/bzImage
+          retention-days: 30  # 延长保存30天，足够下载和备份
+          if-no-files-found: error  # 无文件则报错，及时发现编译失败
