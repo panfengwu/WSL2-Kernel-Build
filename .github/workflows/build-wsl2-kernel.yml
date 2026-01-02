@@ -36,7 +36,7 @@ jobs:
 
       # 步骤5：上传编译好的内核文件（方便下载）
       - name: Upload Compiled bzImage
-        uses: actions/upload-artifact@v3.3  # 使用 v3 版本
+        uses: actions/upload-artifact@v6  # 使用 v3 版本
         with:
           name: wsl2-waydroid-kernel
           path: WSL2-Linux-Kernel/arch/x86/boot/bzImage
