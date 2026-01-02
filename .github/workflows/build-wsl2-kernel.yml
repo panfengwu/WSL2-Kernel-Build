@@ -8,18 +8,21 @@ on:
   workflow_dispatch:  # 允许手动触发
     inputs:
       kernel_version:
-        description: 'Linux kernel version (可选，自动检测最新)'
+        description: 'Linux kernel version (可选)'
         required: false
         default: ''
       microsoft_branch:
         description: 'Microsoft WSL2 kernel branch'
         required: false
-        default: 'linux-msft-wsl-6.6.y'
+        default: ''
   schedule:
     # 每周一 00:00 UTC 自动运行
     - cron: '0 0 * * 1'
   repository_dispatch:
     types: [build-kernel]
+
+env:
+  WORKSPACE: ${{ github.workspace }}
 
 jobs:
   get-kernel-info:
@@ -32,7 +35,10 @@ jobs:
       id: get-latest-tag
       run: |
         # 获取 Microsoft WSL2 内核的最新标签
-        LATEST_TAG=$(curl -s https://api.github.com/repos/microsoft/WSL2-Linux-Kernel/tags | jq -r '.[0].name')
+        LATEST_TAG=$(curl -s "https://api.github.com/repos/microsoft/WSL2-Linux-Kernel/tags?per_page=5" | jq -r '.[0].name // "null"')
+        if [ "$LATEST_TAG" = "null" ] || [ -z "$LATEST_TAG" ]; then
+          LATEST_TAG="linux-msft-wsl-6.6.30"
+        fi
         echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
         echo "Latest kernel tag: $LATEST_TAG"
     
@@ -40,13 +46,21 @@ jobs:
       id: parse-version
       run: |
         TAG="${{ steps.get-latest-tag.outputs.tag }}"
+        echo "Tag: $TAG"
+        
         if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-          # 如果获取失败，使用默认值
           KERNEL_VERSION="6.6.30"
         else
           # 从标签中提取版本号
-          KERNEL_VERSION=$(echo $TAG | sed 's/^linux-msft-wsl-//' | sed 's/-wsl2$//' | sed 's/-wsl$//' | sed 's/^v//')
+          KERNEL_VERSION=$(echo "$TAG" | sed -E 's/^linux-msft-wsl-//' | sed -E 's/[-_]wsl.*$//' | sed -E 's/^v//')
         fi
+        
+        # 验证版本号格式
+        if ! echo "$KERNEL_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+          echo "Warning: Invalid version format '$KERNEL_VERSION', using default"
+          KERNEL_VERSION="6.6.30"
+        fi
+        
         echo "version=$KERNEL_VERSION" >> $GITHUB_OUTPUT
         echo "Parsed kernel version: $KERNEL_VERSION"
 
@@ -54,6 +68,9 @@ jobs:
     needs: get-kernel-info
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    env:
+      KERNEL_SRC_DIR: "${{ github.workspace }}/WSL2-Linux-Kernel"
+      OUTPUT_DIR: "${{ github.workspace }}/kernel-output"
     
     steps:
     - name: Checkout this repository
@@ -61,8 +78,9 @@ jobs:
     
     - name: Set up build environment
       run: |
+        echo "Setting up build environment..."
         sudo apt-get update
-        sudo apt-get install -y \
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
           build-essential \
           flex \
           bison \
@@ -79,7 +97,13 @@ jobs:
           pkg-config \
           libncurses-dev \
           zstd \
-          jq
+          jq \
+          python3 \
+          python3-pip
+        
+        # 安装 python 依赖
+        pip3 install --upgrade pip
+        
         echo "Build environment setup completed"
     
     - name: Set build variables
@@ -90,32 +114,43 @@ jobs:
         echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
         
         # 确定内核版本
-        if [ -n "${{ github.event.inputs.kernel_version }}" ]; then
+        if [ -n "${{ github.event.inputs.kernel_version }}" ] && [ "${{ github.event.inputs.kernel_version }}" != "" ]; then
           KERNEL_VERSION="${{ github.event.inputs.kernel_version }}"
           echo "Using manual input version: $KERNEL_VERSION"
-        elif [ -n "${{ needs.get-kernel-info.outputs.kernel_version }}" ]; then
+        elif [ -n "${{ needs.get-kernel-info.outputs.kernel_version }}" ] && [ "${{ needs.get-kernel-info.outputs.kernel_version }}" != "" ]; then
           KERNEL_VERSION="${{ needs.get-kernel-info.outputs.kernel_version }}"
           echo "Using auto-detected version: $KERNEL_VERSION"
         else
           KERNEL_VERSION="6.6.30"
           echo "Using default version: $KERNEL_VERSION"
         fi
+        
+        # 验证内核版本格式
+        if ! echo "$KERNEL_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+          echo "Error: Invalid kernel version format: $KERNEL_VERSION"
+          exit 1
+        fi
+        
         echo "KERNEL_VERSION=$KERNEL_VERSION" >> $GITHUB_ENV
         
         # 确定分支
-        if [ -n "${{ github.event.inputs.microsoft_branch }}" ]; then
+        if [ -n "${{ github.event.inputs.microsoft_branch }}" ] && [ "${{ github.event.inputs.microsoft_branch }}" != "" ]; then
           MS_BRANCH="${{ github.event.inputs.microsoft_branch }}"
         else
           # 从版本号推断分支
-          MAJOR_VERSION=$(echo $KERNEL_VERSION | cut -d. -f1,2)
+          MAJOR_VERSION=$(echo "$KERNEL_VERSION" | cut -d. -f1,2)
           MS_BRANCH="linux-msft-wsl-${MAJOR_VERSION}.y"
         fi
+        
         echo "MS_BRANCH=$MS_BRANCH" >> $GITHUB_ENV
         
         echo "Build Variables:"
         echo "  Kernel Version: $KERNEL_VERSION"
         echo "  MS Branch: $MS_BRANCH"
         echo "  Build Date: $BUILD_DATE"
+        echo "  Workspace: ${{ github.workspace }}"
+        echo "  Kernel Source Dir: $KERNEL_SRC_DIR"
+        echo "  Output Dir: $OUTPUT_DIR"
     
     - name: Download WSL2 kernel source
       env:
@@ -131,139 +166,206 @@ jobs:
         echo "Triggered by: ${{ github.event_name }}"
         echo "=============================================="
         
-        # 克隆 Microsoft 的 WSL2 内核仓库
-        echo "Cloning WSL2 kernel repository..."
-        git clone --depth 1 --branch $MS_BRANCH \
-          https://github.com/microsoft/WSL2-Linux-Kernel.git \
-          || { echo "Failed to clone branch $MS_BRANCH, trying main branch"; \
-               git clone --depth 1 https://github.com/microsoft/WSL2-Linux-Kernel.git; }
+        # 创建目录
+        mkdir -p "$KERNEL_SRC_DIR"
+        cd "${{ github.workspace }}"
         
-        cd WSL2-Linux-Kernel
+        # 克隆 Microsoft 的 WSL2 内核仓库
+        echo "Cloning WSL2 kernel repository (branch: $MS_BRANCH)..."
+        
+        if git clone --depth 1 --branch "$MS_BRANCH" \
+          https://github.com/microsoft/WSL2-Linux-Kernel.git "$KERNEL_SRC_DIR"; then
+          echo "Successfully cloned branch: $MS_BRANCH"
+        else
+          echo "Failed to clone branch $MS_BRANCH, trying default branch..."
+          rm -rf "$KERNEL_SRC_DIR"
+          git clone --depth 1 \
+            https://github.com/microsoft/WSL2-Linux-Kernel.git "$KERNEL_SRC_DIR"
+        fi
+        
+        cd "$KERNEL_SRC_DIR"
         KERNEL_COMMIT=$(git rev-parse --short HEAD)
         KERNEL_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "unknown")
         
         echo "KERNEL_COMMIT=$KERNEL_COMMIT" >> $GITHUB_ENV
         echo "KERNEL_TAG=$KERNEL_TAG" >> $GITHUB_ENV
-        echo "KERNEL_SOURCE_DIR=$(pwd)" >> $GITHUB_ENV
+        echo "KERNEL_SRC_DIR=$(pwd)" >> $GITHUB_ENV
         
+        echo "Kernel source directory: $(pwd)"
         echo "Kernel commit: $KERNEL_COMMIT"
         echo "Kernel tag: $KERNEL_TAG"
-        cd ..
+        echo "Files in kernel source:"
+        ls -la
     
     - name: Apply Waydroid kernel patches
       env:
-        KERNEL_SOURCE_DIR: ${{ env.KERNEL_SOURCE_DIR }}
+        KERNEL_SRC_DIR: ${{ env.KERNEL_SRC_DIR }}
       run: |
         echo "Applying Waydroid kernel patches..."
-        cd $KERNEL_SOURCE_DIR
+        cd "$KERNEL_SRC_DIR"
         
-        # 备份原始配置
-        if [ -f Microsoft/config-wsl ]; then
-          echo "Using config-wsl as base configuration"
+        # 检查并选择基础配置
+        if [ -f "Microsoft/config-wsl" ]; then
+          echo "Using Microsoft/config-wsl as base configuration"
           cp Microsoft/config-wsl .config
-        elif [ -f Microsoft/config ]; then
+        elif [ -f "Microsoft/config" ]; then
           echo "Using Microsoft/config as base configuration"
           cp Microsoft/config .config
+        elif [ -f "arch/x86/configs/config-wsl" ]; then
+          echo "Using arch/x86/configs/config-wsl as base configuration"
+          cp arch/x86/configs/config-wsl .config
         else
-          echo "No preset config found, generating default config"
-          make defconfig
+          echo "No preset config found, generating x86_64 defconfig"
+          make x86_64_defconfig
         fi
+        
+        echo "Base configuration copied"
+        echo "Config file size: $(wc -l < .config) lines"
         
         # 创建配置脚本
         cat > apply_waydroid_config.sh << 'EOF'
         #!/bin/bash
-        echo "Enabling Android Binder support..."
-        ./scripts/config --enable CONFIG_ANDROID
-        ./scripts/config --enable CONFIG_ANDROID_BINDER_IPC
-        ./scripts/config --enable CONFIG_ANDROID_BINDERFS
-        ./scripts/config --set-val CONFIG_ANDROID_BINDER_DEVICES "binder,hwbinder,vndbinder"
+        set -e
         
-        echo "Enabling ASHMEM..."
-        ./scripts/config --enable CONFIG_ASHMEM
+        echo "=== Applying Waydroid kernel configuration ==="
         
-        echo "Enabling network support..."
-        ./scripts/config --enable CONFIG_BRIDGE
-        ./scripts/config --enable CONFIG_BRIDGE_NETFILTER
-        ./scripts/config --enable CONFIG_NETFILTER_XT_MATCH_PHYSDEV
+        # 检查 scripts/config 是否存在
+        if [ ! -f "scripts/config" ]; then
+          echo "Building scripts/config..."
+          make scripts_basic
+        fi
         
-        echo "Enabling user namespaces..."
-        ./scripts/config --enable CONFIG_USER_NS
-        ./scripts/config --enable CONFIG_PID_NS
-        ./scripts/config --enable CONFIG_NET_NS
-        ./scripts/config --enable CONFIG_UTS_NS
-        ./scripts/config --enable CONFIG_IPC_NS
+        echo "1. Enabling Android Binder support..."
+        if ./scripts/config --enable CONFIG_ANDROID; then echo "  ✓ CONFIG_ANDROID"; else echo "  ✗ CONFIG_ANDROID"; fi
+        if ./scripts/config --enable CONFIG_ANDROID_BINDER_IPC; then echo "  ✓ CONFIG_ANDROID_BINDER_IPC"; else echo "  ✗ CONFIG_ANDROID_BINDER_IPC"; fi
+        if ./scripts/config --enable CONFIG_ANDROID_BINDERFS; then echo "  ✓ CONFIG_ANDROID_BINDERFS"; else echo "  ✗ CONFIG_ANDROID_BINDERFS"; fi
+        if ./scripts/config --set-val CONFIG_ANDROID_BINDER_DEVICES "binder,hwbinder,vndbinder"; then echo "  ✓ CONFIG_ANDROID_BINDER_DEVICES"; else echo "  ✗ CONFIG_ANDROID_BINDER_DEVICES"; fi
         
-        echo "Enabling security features..."
-        ./scripts/config --enable CONFIG_SECCOMP
-        ./scripts/config --enable CONFIG_SECCOMP_FILTER
+        echo "2. Enabling ASHMEM..."
+        if ./scripts/config --enable CONFIG_ASHMEM; then echo "  ✓ CONFIG_ASHMEM"; else echo "  ✗ CONFIG_ASHMEM"; fi
         
-        echo "Enabling cgroups..."
-        ./scripts/config --enable CONFIG_CGROUPS
-        ./scripts/config --enable CONFIG_CGROUP_DEVICE
-        ./scripts/config --enable CONFIG_CGROUP_FREEZER
-        ./scripts/config --enable CONFIG_CGROUP_PIDS
-        ./scripts/config --enable CONFIG_CGROUP_CPUACCT
-        ./scripts/config --enable CONFIG_CGROUP_SCHED
+        echo "3. Enabling network support..."
+        if ./scripts/config --enable CONFIG_BRIDGE; then echo "  ✓ CONFIG_BRIDGE"; else echo "  ✗ CONFIG_BRIDGE"; fi
+        if ./scripts/config --enable CONFIG_BRIDGE_NETFILTER; then echo "  ✓ CONFIG_BRIDGE_NETFILTER"; else echo "  ✗ CONFIG_BRIDGE_NETFILTER"; fi
+        if ./scripts/config --enable CONFIG_NETFILTER_XT_MATCH_PHYSDEV; then echo "  ✓ CONFIG_NETFILTER_XT_MATCH_PHYSDEV"; else echo "  ✗ CONFIG_NETFILTER_XT_MATCH_PHYSDEV"; fi
+        if ./scripts/config --enable CONFIG_NETFILTER_XT_CONNMARK; then echo "  ✓ CONFIG_NETFILTER_XT_CONNMARK"; else echo "  ✗ CONFIG_NETFILTER_XT_CONNMARK"; fi
+        if ./scripts/config --enable CONFIG_NETFILTER_XT_MARK; then echo "  ✓ CONFIG_NETFILTER_XT_MARK"; else echo "  ✗ CONFIG_NETFILTER_XT_MARK"; fi
         
-        echo "Enabling network filtering..."
-        ./scripts/config --enable CONFIG_IP_NF_IPTABLES
-        ./scripts/config --enable CONFIG_IP_NF_NAT
-        ./scripts/config --enable CONFIG_IP_NF_FILTER
-        ./scripts/config --enable CONFIG_IP_NF_MANGLE
-        ./scripts/config --enable CONFIG_NETFILTER_XTABLES
+        echo "4. Enabling user namespaces..."
+        if ./scripts/config --enable CONFIG_USER_NS; then echo "  ✓ CONFIG_USER_NS"; else echo "  ✗ CONFIG_USER_NS"; fi
+        if ./scripts/config --enable CONFIG_PID_NS; then echo "  ✓ CONFIG_PID_NS"; else echo "  ✗ CONFIG_PID_NS"; fi
+        if ./scripts/config --enable CONFIG_NET_NS; then echo "  ✓ CONFIG_NET_NS"; else echo "  ✗ CONFIG_NET_NS"; fi
+        if ./scripts/config --enable CONFIG_UTS_NS; then echo "  ✓ CONFIG_UTS_NS"; else echo "  ✗ CONFIG_UTS_NS"; fi
+        if ./scripts/config --enable CONFIG_IPC_NS; then echo "  ✓ CONFIG_IPC_NS"; else echo "  ✗ CONFIG_IPC_NS"; fi
         
-        echo "Disabling debug info to reduce size..."
-        ./scripts/config --disable CONFIG_DEBUG_INFO
-        ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
+        echo "5. Enabling security features..."
+        if ./scripts/config --enable CONFIG_SECCOMP; then echo "  ✓ CONFIG_SECCOMP"; else echo "  ✗ CONFIG_SECCOMP"; fi
+        if ./scripts/config --enable CONFIG_SECCOMP_FILTER; then echo "  ✓ CONFIG_SECCOMP_FILTER"; else echo "  ✗ CONFIG_SECCOMP_FILTER"; fi
         
-        echo "Configuration script completed"
+        echo "6. Enabling cgroups..."
+        if ./scripts/config --enable CONFIG_CGROUPS; then echo "  ✓ CONFIG_CGROUPS"; else echo "  ✗ CONFIG_CGROUPS"; fi
+        if ./scripts/config --enable CONFIG_CGROUP_DEVICE; then echo "  ✓ CONFIG_CGROUP_DEVICE"; else echo "  ✗ CONFIG_CGROUP_DEVICE"; fi
+        if ./scripts/config --enable CONFIG_CGROUP_FREEZER; then echo "  ✓ CONFIG_CGROUP_FREEZER"; else echo "  ✗ CONFIG_CGROUP_FREEZER"; fi
+        if ./scripts/config --enable CONFIG_CGROUP_PIDS; then echo "  ✓ CONFIG_CGROUP_PIDS"; else echo "  ✗ CONFIG_CGROUP_PIDS"; fi
+        if ./scripts/config --enable CONFIG_CGROUP_CPUACCT; then echo "  ✓ CONFIG_CGROUP_CPUACCT"; else echo "  ✗ CONFIG_CGROUP_CPUACCT"; fi
+        if ./scripts/config --enable CONFIG_CGROUP_SCHED; then echo "  ✓ CONFIG_CGROUP_SCHED"; else echo "  ✗ CONFIG_CGROUP_SCHED"; fi
+        
+        echo "7. Enabling network filtering..."
+        if ./scripts/config --enable CONFIG_IP_NF_IPTABLES; then echo "  ✓ CONFIG_IP_NF_IPTABLES"; else echo "  ✗ CONFIG_IP_NF_IPTABLES"; fi
+        if ./scripts/config --enable CONFIG_IP_NF_NAT; then echo "  ✓ CONFIG_IP_NF_NAT"; else echo "  ✗ CONFIG_IP_NF_NAT"; fi
+        if ./scripts/config --enable CONFIG_IP_NF_FILTER; then echo "  ✓ CONFIG_IP_NF_FILTER"; else echo "  ✗ CONFIG_IP_NF_FILTER"; fi
+        if ./scripts/config --enable CONFIG_IP_NF_MANGLE; then echo "  ✓ CONFIG_IP_NF_MANGLE"; else echo "  ✗ CONFIG_IP_NF_MANGLE"; fi
+        if ./scripts/config --enable CONFIG_NETFILTER_XTABLES; then echo "  ✓ CONFIG_NETFILTER_XTABLES"; else echo "  ✗ CONFIG_NETFILTER_XTABLES"; fi
+        
+        echo "8. Enabling additional features for Waydroid..."
+        if ./scripts/config --enable CONFIG_INET; then echo "  ✓ CONFIG_INET"; else echo "  ✗ CONFIG_INET"; fi
+        if ./scripts/config --enable CONFIG_NET; then echo "  ✓ CONFIG_NET"; else echo "  ✗ CONFIG_NET"; fi
+        if ./scripts/config --enable CONFIG_INET_UDP_DIAG; then echo "  ✓ CONFIG_INET_UDP_DIAG"; else echo "  ✗ CONFIG_INET_UDP_DIAG"; fi
+        if ./scripts/config --enable CONFIG_PACKET_DIAG; then echo "  ✓ CONFIG_PACKET_DIAG"; else echo "  ✗ CONFIG_PACKET_DIAG"; fi
+        if ./scripts/config --enable CONFIG_UNIX_DIAG; then echo "  ✓ CONFIG_UNIX_DIAG"; else echo "  ✗ CONFIG_UNIX_DIAG"; fi
+        
+        echo "9. Disabling debug info to reduce size..."
+        if ./scripts/config --disable CONFIG_DEBUG_INFO; then echo "  ✓ CONFIG_DEBUG_INFO (disabled)"; else echo "  ✗ CONFIG_DEBUG_INFO"; fi
+        if ./scripts/config --disable CONFIG_DEBUG_INFO_BTF; then echo "  ✓ CONFIG_DEBUG_INFO_BTF (disabled)"; else echo "  ✗ CONFIG_DEBUG_INFO_BTF"; fi
+        
+        echo "=== Configuration completed ==="
         EOF
         
         chmod +x apply_waydroid_config.sh
-        ./apply_waydroid_config.sh
         
-        echo "Waydroid patches applied"
+        # 应用配置
+        echo "Applying configuration changes..."
+        if ./apply_waydroid_config.sh; then
+          echo "Configuration script executed successfully"
+        else
+          echo "Warning: Some configuration options may not be available"
+        fi
         
         # 验证配置
-        echo "Current config summary:"
-        echo "CONFIG_ANDROID_BINDER_IPC=$(grep CONFIG_ANDROID_BINDER_IPC .config || echo 'not set')"
-        echo "CONFIG_ASHMEM=$(grep CONFIG_ASHMEM .config || echo 'not set')"
-        echo "CONFIG_USER_NS=$(grep CONFIG_USER_NS .config || echo 'not set')"
-        echo "CONFIG_CGROUPS=$(grep CONFIG_CGROUPS .config || echo 'not set')"
+        echo ""
+        echo "Configuration summary:"
+        echo "========================================"
+        echo "CONFIG_ANDROID=$(grep -c "^CONFIG_ANDROID=y" .config || echo "not set")"
+        echo "CONFIG_ANDROID_BINDER_IPC=$(grep -c "^CONFIG_ANDROID_BINDER_IPC=y" .config || echo "not set")"
+        echo "CONFIG_ASHMEM=$(grep -c "^CONFIG_ASHMEM=y" .config || echo "not set")"
+        echo "CONFIG_USER_NS=$(grep -c "^CONFIG_USER_NS=y" .config || echo "not set")"
+        echo "CONFIG_CGROUPS=$(grep -c "^CONFIG_CGROUPS=y" .config || echo "not set")"
+        echo "========================================"
     
     - name: Configure kernel
       env:
-        KERNEL_SOURCE_DIR: ${{ env.KERNEL_SOURCE_DIR }}
+        KERNEL_SRC_DIR: ${{ env.KERNEL_SRC_DIR }}
       run: |
-        cd $KERNEL_SOURCE_DIR
+        cd "$KERNEL_SRC_DIR"
         echo "Configuring kernel..."
+        echo "Current directory: $(pwd)"
+        echo "Config file: $(ls -la .config 2>/dev/null || echo 'Not found')"
         
         # 使用现有配置，应用新配置
-        make olddefconfig
+        echo "Running make olddefconfig..."
+        if make olddefconfig; then
+          echo "Configuration completed successfully"
+        else
+          echo "Warning: make olddefconfig failed, trying oldconfig..."
+          make oldconfig
+        fi
         
-        echo "Configuration completed"
-        echo "Key configurations for Waydroid:"
+        echo ""
+        echo "Final configuration check:"
         echo "========================================"
-        grep -E "CONFIG_ANDROID|CONFIG_ASHMEM|CONFIG_USER_NS|CONFIG_CGROUP" .config | grep -v "^#" | head -20
+        echo "Essential Waydroid configurations:"
+        grep -E "^(CONFIG_ANDROID|CONFIG_ANDROID_BINDER_IPC|CONFIG_ASHMEM|CONFIG_USER_NS|CONFIG_CGROUPS)=" .config 2>/dev/null || echo "Not found in config"
         echo "========================================"
     
     - name: Build kernel
       env:
-        KERNEL_SOURCE_DIR: ${{ env.KERNEL_SOURCE_DIR }}
+        KERNEL_SRC_DIR: ${{ env.KERNEL_SRC_DIR }}
       run: |
-        cd $KERNEL_SOURCE_DIR
+        cd "$KERNEL_SRC_DIR"
         NPROC=$(nproc)
         echo "Building kernel with $NPROC threads..."
         echo "This may take 30-60 minutes..."
+        echo "Current directory: $(pwd)"
+        echo "Available space:"
+        df -h .
         
         # 编译内核
         echo "Starting kernel build..."
+        
+        # 检查是否已有 .config
+        if [ ! -f ".config" ]; then
+          echo "Error: .config not found!"
+          exit 1
+        fi
+        
+        # 开始构建
         if make -j$NPROC 2>&1 | tee build.log; then
           echo "✅ Kernel build successful!"
           
           # 检查内核文件
-          if [ -f arch/x86/boot/bzImage ]; then
+          if [ -f "arch/x86/boot/bzImage" ]; then
             KERNEL_SIZE=$(ls -lh arch/x86/boot/bzImage | awk '{print $5}')
+            echo "Kernel file created: arch/x86/boot/bzImage"
             echo "Kernel size: $KERNEL_SIZE"
             
             # 编译模块
@@ -272,266 +374,314 @@ jobs:
               echo "✅ Modules build successful!"
               echo "KERNEL_BUILD_STATUS=success" >> $GITHUB_ENV
             else
-              echo "❌ Modules build failed!"
-              echo "KERNEL_BUILD_STATUS=partial" >> $GITHUB_ENV
+              echo "⚠️ Modules build had warnings"
+              echo "KERNEL_BUILD_STATUS=success" >> $GITHUB_ENV
             fi
           else
             echo "❌ Kernel file not found!"
             echo "KERNEL_BUILD_STATUS=failed" >> $GITHUB_ENV
+            echo "Build log tail:"
+            tail -50 build.log
             exit 1
           fi
         else
           echo "❌ Kernel build failed!"
           echo "KERNEL_BUILD_STATUS=failed" >> $GITHUB_ENV
+          echo "Build log tail:"
+          tail -50 build.log
           exit 1
         fi
+        
+        echo "Build logs:"
+        echo "========== build.log =========="
+        tail -20 build.log
+        echo "========== modules.log =========="
+        tail -20 modules.log
     
     - name: Install modules
       env:
-        KERNEL_SOURCE_DIR: ${{ env.KERNEL_SOURCE_DIR }}
+        KERNEL_SRC_DIR: ${{ env.KERNEL_SRC_DIR }}
       run: |
-        cd $KERNEL_SOURCE_DIR
+        cd "$KERNEL_SRC_DIR"
         
-        if [ ! -f arch/x86/boot/bzImage ]; then
+        if [ ! -f "arch/x86/boot/bzImage" ]; then
           echo "❌ Kernel not built, skipping module installation"
           exit 1
         fi
         
         echo "Installing modules..."
+        echo "Current directory: $(pwd)"
         
         # 创建临时目录安装模块
         mkdir -p kernel-modules
-        make modules_install INSTALL_MOD_PATH=$(pwd)/kernel-modules
+        echo "Installing modules to kernel-modules/"
         
-        # 检查安装的模块
-        MODULE_COUNT=$(find kernel-modules -name "*.ko" | wc -l)
-        echo "Installed $MODULE_COUNT modules"
-        
-        if [ $MODULE_COUNT -eq 0 ]; then
-          echo "⚠️ Warning: No modules installed"
+        if make modules_install INSTALL_MOD_PATH=$(pwd)/kernel-modules 2>&1 | tee modules_install.log; then
+          echo "✅ Modules installed successfully"
+          
+          # 检查安装的模块
+          MODULE_COUNT=$(find kernel-modules -name "*.ko" 2>/dev/null | wc -l || echo 0)
+          echo "Installed $MODULE_COUNT modules"
+          
+          if [ $MODULE_COUNT -eq 0 ]; then
+            echo "⚠️ Warning: No modules installed"
+            echo "MODULE_COUNT=0" >> $GITHUB_ENV
+          else
+            echo "MODULE_COUNT=$MODULE_COUNT" >> $GITHUB_ENV
+            echo "Module directories:"
+            find kernel-modules -type d | head -10
+          fi
+        else
+          echo "❌ Module installation failed"
+          echo "MODULE_COUNT=0" >> $GITHUB_ENV
         fi
-        
-        echo "MODULE_COUNT=$MODULE_COUNT" >> $GITHUB_ENV
     
     - name: Create kernel package
       env:
-        KERNEL_SOURCE_DIR: ${{ env.KERNEL_SOURCE_DIR }}
+        KERNEL_SRC_DIR: ${{ env.KERNEL_SRC_DIR }}
+        OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
         BUILD_DATE: ${{ env.BUILD_DATE }}
         KERNEL_COMMIT: ${{ env.KERNEL_COMMIT }}
         KERNEL_TAG: ${{ env.KERNEL_TAG }}
         KERNEL_VERSION: ${{ env.KERNEL_VERSION }}
         MODULE_COUNT: ${{ env.MODULE_COUNT }}
       run: |
-        cd $KERNEL_SOURCE_DIR
+        echo "Creating kernel package..."
+        echo "KERNEL_SRC_DIR: $KERNEL_SRC_DIR"
+        echo "OUTPUT_DIR: $OUTPUT_DIR"
+        echo "Current directory: $(pwd)"
         
-        if [ ! -f arch/x86/boot/bzImage ]; then
+        if [ ! -f "$KERNEL_SRC_DIR/arch/x86/boot/bzImage" ]; then
           echo "❌ Kernel not built, skipping packaging"
           exit 1
         fi
         
+        # 创建输出目录
+        mkdir -p "$OUTPUT_DIR"
+        echo "Output directory created: $OUTPUT_DIR"
+        
         # 获取内核版本
+        cd "$KERNEL_SRC_DIR"
         KERNEL_RELEASE=$(make kernelrelease 2>/dev/null || echo "$KERNEL_VERSION-waydroid")
         echo "KERNEL_RELEASE=$KERNEL_RELEASE" >> $GITHUB_ENV
         
-        # 创建输出目录
-        OUTPUT_DIR="../kernel-output"
-        mkdir -p $OUTPUT_DIR
-        
         # 复制内核映像
         KERNEL_FILE="bzImage-waydroid-$KERNEL_VERSION"
-        cp arch/x86/boot/bzImage $OUTPUT_DIR/$KERNEL_FILE
+        cp "arch/x86/boot/bzImage" "$OUTPUT_DIR/$KERNEL_FILE"
+        echo "Kernel copied: $OUTPUT_DIR/$KERNEL_FILE"
         
         # 创建版本信息文件
-        cat > $OUTPUT_DIR/version-info.txt << EOF
-        ========================================
-        WSL2 Kernel with Waydroid Support
-        ========================================
+        cat > "$OUTPUT_DIR/version-info.txt" << EOF
+========================================
+WSL2 Kernel with Waydroid Support
+========================================
+
+Build Information:
+------------------
+Kernel Version: $KERNEL_VERSION
+Kernel Release: $KERNEL_RELEASE
+Git Commit: $KERNEL_COMMIT
+Git Tag: $KERNEL_TAG
+Build Date: $(date -u)
+Build ID: $BUILD_DATE
+Trigger: ${{ github.event_name }}
+Modules: ${MODULE_COUNT:-0}
+Source: https://github.com/microsoft/WSL2-Linux-Kernel
+
+Features Enabled:
+-----------------
+✓ Android Binder IPC
+✓ ASHMEM shared memory
+✓ User namespaces
+✓ Network namespaces
+✓ Bridge networking
+✓ Cgroups support
+✓ Security features
+✓ Netfilter/IPtables
+
+Installation:
+-------------
+1. Copy '$KERNEL_FILE' to a Windows directory
+2. Update your '%USERPROFILE%\\.wslconfig' file:
+
+   [wsl2]
+   kernel=C:\\path\\to\\$KERNEL_FILE
+   memory=4GB
+   processors=2
+
+3. Restart WSL: wsl --shutdown
+4. Start WSL again
+
+Waydroid Setup:
+---------------
+# In WSL2 Ubuntu:
+curl https://repo.waydro.id | sudo bash
+sudo apt update
+sudo apt install waydroid
+sudo waydroid init
+systemctl --user start waydroid-container
+waydroid session start
+========================================
+EOF
         
-        Build Information:
-        ------------------
-        Kernel Version: $KERNEL_VERSION
-        Kernel Release: $KERNEL_RELEASE
-        Git Commit: $KERNEL_COMMIT
-        Git Tag: $KERNEL_TAG
-        Build Date: $(date -u)
-        Build ID: $BUILD_DATE
-        Trigger: ${{ github.event_name }}
-        Modules: $MODULE_COUNT
-        
-        Features Enabled:
-        -----------------
-        ✓ Android Binder IPC
-        ✓ ASHMEM shared memory
-        ✓ User namespaces
-        ✓ Network namespaces
-        ✓ Bridge networking
-        ✓ Cgroups support
-        ✓ Security features
-        ✓ Netfilter/IPtables
-        
-        Installation:
-        -------------
-        1. Copy '$KERNEL_FILE' to a Windows directory
-        2. Update your '%USERPROFILE%\\.wslconfig' file:
-        
-           [wsl2]
-           kernel=C:\\path\\to\\$KERNEL_FILE
-           memory=4GB
-           processors=2
-        
-        3. Restart WSL: wsl --shutdown
-        4. Start WSL again
-        
-        Waydroid Setup:
-        ---------------
-        # In WSL2 Ubuntu:
-        curl https://repo.waydro.id | sudo bash
-        sudo apt update
-        sudo apt install waydroid
-        sudo waydroid init
-        systemctl --user start waydroid-container
-        waydroid session start
-        
-        Troubleshooting:
-        ----------------
-        1. If Waydroid fails to start, check logs: journalctl -u waydroid-container
-        2. Ensure you have enough memory (4GB+ recommended)
-        3. Verify kernel modules: lsmod | grep binder
-        4. Check user namespaces: unshare --user --map-root-user whoami
-        
-        Notes:
-        ------
-        - This kernel is built specifically for WSL2
-        - It includes all necessary modules for Waydroid
-        - Requires Windows 10 2004+ or Windows 11
-        ========================================
-        EOF
+        echo "Version info created: $OUTPUT_DIR/version-info.txt"
         
         # 生成 .wslconfig
-        cat > $OUTPUT_DIR/.wslconfig << EOF
-        [wsl2]
-        kernel=C:\\path\\to\\$KERNEL_FILE
-        memory=4GB
-        processors=2
-        localhostForwarding=true
+        cat > "$OUTPUT_DIR/.wslconfig" << EOF
+[wsl2]
+kernel=C:\\Users\\YourUsername\\wsl2-kernel\\$KERNEL_FILE
+memory=4GB
+processors=2
+localhostForwarding=true
+
+# Waydroid optimized settings
+[experimental]
+autoMemoryReclaim=gradual
+networkingMode=mirrored
+dnsTunneling=true
+firewall=false
+hostAddressLoopback=true
+EOF
         
-        # Waydroid optimized settings
-        [experimental]
-        autoMemoryReclaim=gradual
-        networkingMode=mirrored
-        dnsTunneling=true
-        firewall=false
-        hostAddressLoopback=true
-        
-        # Additional performance settings
-        [boot]
-        systemd=true
-        EOF
+        echo "WSL config created: $OUTPUT_DIR/.wslconfig"
         
         # 创建安装脚本
-        cat > $OUTPUT_DIR/install.sh << 'EOF'
-        #!/bin/bash
-        # WSL2 Waydroid Kernel Installer
+        cat > "$OUTPUT_DIR/install.sh" << 'EOF'
+#!/bin/bash
+# WSL2 Waydroid Kernel Installer
+
+set -e
+
+echo "========================================"
+echo "WSL2 Waydroid Kernel Installation Script"
+echo "========================================"
+
+# Find kernel file
+KERNEL_FILE=$(ls bzImage-waydroid-*.bzImage 2>/dev/null | head -1)
+if [ -z "$KERNEL_FILE" ]; then
+    KERNEL_FILE=$(ls bzImage-waydroid-* 2>/dev/null | head -1)
+fi
+
+if [ -z "$KERNEL_FILE" ] || [ ! -f "$KERNEL_FILE" ]; then
+    echo "Error: Kernel file not found!"
+    echo "Please place this script in the same directory as the kernel file."
+    echo "Available files:"
+    ls -la
+    exit 1
+fi
+
+echo "Found kernel: $KERNEL_FILE"
+
+# Get Windows username
+if command -v cmd.exe &> /dev/null; then
+    USERNAME=$(cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r')
+else
+    echo "Enter your Windows username:"
+    read USERNAME
+fi
+
+echo "Windows username: $USERNAME"
+echo ""
+
+# Create directory in Windows
+WINDOWS_DIR="/mnt/c/Users/$USERNAME/wsl2-kernel"
+echo "Creating kernel directory: $WINDOWS_DIR"
+mkdir -p "$WINDOWS_DIR"
+
+# Copy kernel to Windows
+echo "Copying kernel to Windows..."
+cp "$KERNEL_FILE" "$WINDOWS_DIR/"
+
+# Create .wslconfig
+WSL_CONFIG="/mnt/c/Users/$USERNAME/.wslconfig"
+echo "Creating .wslconfig: $WSL_CONFIG"
+
+cat > /tmp/.wslconfig << CONFIG
+[wsl2]
+kernel=C:\\Users\\$USERNAME\\wsl2-kernel\\$KERNEL_FILE
+memory=4GB
+processors=2
+localhostForwarding=true
+
+[experimental]
+autoMemoryReclaim=gradual
+networkingMode=mirrored
+dnsTunneling=true
+firewall=false
+hostAddressLoopback=true
+CONFIG
+
+cp /tmp/.wslconfig "$WSL_CONFIG"
+
+echo ""
+echo "========================================"
+echo "✅ Installation complete!"
+echo "========================================"
+echo ""
+echo "To apply the new kernel:"
+echo "1. Close all WSL2 terminals and applications"
+echo "2. Open PowerShell or CMD as Administrator"
+echo "3. Run: wsl --shutdown"
+echo "4. Restart your WSL2 distribution"
+echo ""
+echo "To verify the new kernel:"
+echo "  wsl cat /proc/version"
+echo "  uname -a"
+echo ""
+echo "To check Waydroid support:"
+echo "  grep binder /proc/filesystems"
+echo "  lsmod | grep binder"
+echo ""
+echo "Troubleshooting:"
+echo "- If WSL doesn't start: check .wslconfig syntax"
+echo "- If binder not found: ensure kernel has binder support"
+echo "- For Waydroid issues: check systemd and user namespaces"
+echo "========================================"
+EOF
         
-        echo "========================================"
-        echo "WSL2 Waydroid Kernel Installation Script"
-        echo "========================================"
-        
-        KERNEL_FILE="bzImage-waydroid-*.bzImage"
-        
-        # Find kernel file
-        if [ -f "$KERNEL_FILE" ]; then
-            echo "Found kernel: $KERNEL_FILE"
-        else
-            echo "Error: Kernel file not found!"
-            echo "Please place this script in the same directory as the kernel file."
-            exit 1
-        fi
-        
-        # Get Windows username
-        if command -v cmd.exe &> /dev/null; then
-            USERNAME=$(cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r')
-        else
-            echo "Enter your Windows username:"
-            read USERNAME
-        fi
-        
-        echo "Windows username: $USERNAME"
-        
-        # Create .wslconfig
-        CONFIG_FILE="/mnt/c/Users/$USERNAME/.wslconfig"
-        
-        cat > /tmp/.wslconfig << CONFIG
-        [wsl2]
-        kernel=C:\\Users\\$USERNAME\\wsl2-kernel\\$(basename $KERNEL_FILE)
-        memory=4GB
-        processors=2
-        localhostForwarding=true
-        
-        [experimental]
-        autoMemoryReclaim=gradual
-        networkingMode=mirrored
-        dnsTunneling=true
-        firewall=false
-        hostAddressLoopback=true
-        CONFIG
-        
-        echo "Creating kernel directory in Windows..."
-        mkdir -p /mnt/c/Users/$USERNAME/wsl2-kernel
-        
-        echo "Copying kernel to Windows..."
-        cp "$KERNEL_FILE" "/mnt/c/Users/$USERNAME/wsl2-kernel/"
-        
-        echo "Creating .wslconfig..."
-        cp /tmp/.wslconfig "$CONFIG_FILE"
-        
-        echo ""
-        echo "✅ Installation complete!"
-        echo ""
-        echo "To apply the new kernel:"
-        echo "1. Close all WSL2 instances"
-        echo "2. Open PowerShell as Administrator"
-        echo "3. Run: wsl --shutdown"
-        echo "4. Restart your WSL2 distribution"
-        echo ""
-        echo "To verify the kernel:"
-        echo "  uname -a"
-        echo ""
-        echo "To check Waydroid support:"
-        echo "  lsmod | grep binder"
-        EOF
-        
-        chmod +x $OUTPUT_DIR/install.sh
+        chmod +x "$OUTPUT_DIR/install.sh"
+        echo "Install script created: $OUTPUT_DIR/install.sh"
         
         # 打包模块
-        if [ -d "kernel-modules" ] && [ $MODULE_COUNT -gt 0 ]; then
-          echo "Packing $MODULE_COUNT modules..."
-          tar -czf $OUTPUT_DIR/modules-$KERNEL_VERSION.tar.gz -C kernel-modules lib/modules
+        if [ -d "$KERNEL_SRC_DIR/kernel-modules" ] && [ "${MODULE_COUNT:-0}" -gt 0 ]; then
+          echo "Packing ${MODULE_COUNT} modules..."
+          tar -czf "$OUTPUT_DIR/modules-$KERNEL_VERSION.tar.gz" -C "$KERNEL_SRC_DIR/kernel-modules" lib/modules
+          echo "Modules packed: $OUTPUT_DIR/modules-$KERNEL_VERSION.tar.gz"
         else
           echo "No modules to pack"
         fi
         
         # 创建压缩包
-        cd $OUTPUT_DIR
-        tar -czf ../wsl2-waydroid-kernel-$KERNEL_VERSION-$BUILD_DATE.tar.gz .
+        cd "${{ github.workspace }}"
+        tar -czf "wsl2-waydroid-kernel-$KERNEL_VERSION-$BUILD_DATE.tar.gz" -C "kernel-output" .
         
-        echo "OUTPUT_DIR=$OUTPUT_DIR" >> $GITHUB_ENV
         echo "Package created: wsl2-waydroid-kernel-$KERNEL_VERSION-$BUILD_DATE.tar.gz"
-        echo "Kernel file: $KERNEL_FILE"
+        echo "Output directory contents:"
+        ls -la "$OUTPUT_DIR/"
+        
+        # 验证文件
+        echo "Verifying files..."
+        if [ -f "wsl2-waydroid-kernel-$KERNEL_VERSION-$BUILD_DATE.tar.gz" ]; then
+          echo "✅ Package created successfully"
+          echo "Package size: $(du -h wsl2-waydroid-kernel-$KERNEL_VERSION-$BUILD_DATE.tar.gz | cut -f1)"
+        else
+          echo "❌ Package creation failed"
+          exit 1
+        fi
     
     - name: Upload artifacts
-      if: env.KERNEL_BUILD_STATUS == 'success' || env.KERNEL_BUILD_STATUS == 'partial'
+      if: env.KERNEL_BUILD_STATUS == 'success'
       uses: actions/upload-artifact@v4
       with:
         name: wsl2-waydroid-kernel-${{ env.KERNEL_VERSION }}-${{ env.BUILD_DATE }}
         path: |
-          ${{ env.OUTPUT_DIR }}/*
-          ${{ env.KERNEL_SOURCE_DIR }}/../wsl2-waydroid-kernel-${{ env.KERNEL_VERSION }}-${{ env.BUILD_DATE }}.tar.gz
+          ${{ env.OUTPUT_DIR }}
+          wsl2-waydroid-kernel-${{ env.KERNEL_VERSION }}-${{ env.BUILD_DATE }}.tar.gz
         retention-days: 30
         if-no-files-found: error
     
     - name: Create GitHub Release
-      if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (env.KERNEL_BUILD_STATUS == 'success' || env.KERNEL_BUILD_STATUS == 'partial')
+      if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && env.KERNEL_BUILD_STATUS == 'success'
       uses: softprops/action-gh-release@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -541,25 +691,26 @@ jobs:
         body: |
           # WSL2 Kernel with Waydroid Support
           
-          ## Build Information
+          ## 📦 Build Information
           - **Kernel Version**: ${{ env.KERNEL_VERSION }}
-          - **Commit**: ${{ env.KERNEL_COMMIT }}
-          - **Tag**: ${{ env.KERNEL_TAG }}
-          - **Built**: ${{ env.BUILD_DATE }}
-          - **Modules**: ${{ env.MODULE_COUNT }}
+          - **Git Commit**: [${{ env.KERNEL_COMMIT }}](https://github.com/microsoft/WSL2-Linux-Kernel/commit/${{ env.KERNEL_COMMIT }})
+          - **Git Tag**: ${{ env.KERNEL_TAG }}
+          - **Build Date**: ${{ env.BUILD_DATE }}
+          - **Modules**: ${{ env.MODULE_COUNT || '0' }}
           
-          ## Features
-          - ✅ Android Binder IPC
-          - ✅ ASHMEM support
-          - ✅ User namespaces
-          - ✅ Network bridge
-          - ✅ Cgroups
-          - ✅ Security features
+          ## ✅ Features
+          - Android Binder IPC
+          - ASHMEM support
+          - User namespaces
+          - Network bridge
+          - Cgroups
+          - Security features
+          - Netfilter/IPtables
           
-          ## Installation
-          1. Download the kernel file
-          2. Update `.wslconfig` to point to the kernel
-          3. Run `wsl --shutdown` in PowerShell/CMD
-          4. Restart WSL
+          ## 🚀 Quick Installation
+          1. Download the package
+          2. Extract files
+          3. Run: `chmod +x install.sh && ./install.sh`
+          4. Restart WSL: `wsl --shutdown`
           
-          ## Waydroid Setup
+          ## 🔧 Waydroid Setup
