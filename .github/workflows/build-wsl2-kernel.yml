@@ -1,0 +1,29 @@
+name: Build WSL2 Kernel for Waydroid
+on: [push]  # 提交文件后自动触发编译
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04  # 云服务器系统，兼容内核编译
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update && sudo apt install -y build-essential flex bison libssl-dev libelf-dev bc python3 pahole cpio dwarves git
+
+      - name: Clone WSL2 Kernel Source
+        run: |
+          git clone --depth=1 -b linux-msft-wsl-6.6.y https://github.com/microsoft/WSL2-Linux-Kernel.git
+          cd WSL2-Linux-Kernel
+
+      - name: Build Kernel (Enable Binder)
+        run: |
+          cd WSL2-Linux-Kernel
+          make -j$(nproc) KCONFIG_CONFIG=microsoft/config-wsl bzImage  # 自动启用binder模块
+
+      - name: Upload Compiled Kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl2-kernel-bzImage
+          path: WSL2-Linux-Kernel/arch/x86/boot/bzImage  # 编译产物路径
