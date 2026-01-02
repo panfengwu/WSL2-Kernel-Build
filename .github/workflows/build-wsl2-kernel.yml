@@ -1,45 +1,43 @@
-name: Build WSL2 Kernel
-
-on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
+name: Build WSL2 Kernel for Waydroid
+on: 
+  push:  # 提交文件自动触发编译
+  workflow_dispatch:  # 手动触发编译（更灵活，推荐）
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-
+  build-kernel:
+    runs-on: ubuntu-24.04
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
+      # 步骤1：检查仓库（必填，初始化环境）
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-    - name: Set up kernel source
-      run: |
-        git clone https://github.com/microsoft/WSL2-Linux-Kernel.git
-        cd WSL2-Linux-Kernel
-        git checkout <your-branch-or-tag>
+      # 步骤2：安装所有编译依赖（完整无遗漏）
+      - name: Install Full Dependencies
+        run: |
+          sudo apt update -y
+          sudo apt install -y build-essential flex bison libssl-dev libelf-dev bc python3 pahole cpio dwarves git --fix-missing
 
-    - name: Install dependencies
-      run: |
-        sudo apt update
-        sudo apt install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc
+      # 步骤3：克隆WSL2内核源码（6.6.x稳定版，深度克隆加快速度）
+      - name: Clone WSL2 Kernel Source Code
+        run: |
+          git clone --depth=1 -b linux-msft-wsl-6.6.y https://github.com/microsoft/WSL2-Linux-Kernel.git
+          cd WSL2-Linux-Kernel
+          # 验证Microsoft目录是否存在（容错检查）
+          ls -la Microsoft/
 
-    - name: Enable binder and ashmem
-      run: |
-        cd WSL2-Linux-Kernel
-        # Enable binder and ashmem support
-        make menuconfig
+      # 步骤4：编译内核（修复Microsoft大小写，绝对路径避免错误）
+      - name: Compile WSL2 Kernel (Enable Binder)
+        run: |
+          cd WSL2-Linux-Kernel
+          # 核心编译命令：使用大写Microsoft，绝对路径确保找到配置
+          make -j$(nproc) KCONFIG_CONFIG=$(pwd)/Microsoft/config-wsl bzImage
+          # 验证bzImage是否生成
+          ls -la arch/x86/boot/bzImage
 
-    - name: Compile kernel
-      run: |
-        cd WSL2-Linux-Kernel
-        make -j$(nproc)
-
-    - name: Upload the compiled kernel
-      uses: actions/upload-artifact@v3.2  # 使用 v3.2 版本
-      with:
-        name: bzImage
-        path: WSL2-Linux-Kernel/arch/x86/boot/bzImage
+      # 步骤5：上传编译好的内核文件（方便下载）
+      - name: Upload Compiled bzImage
+        uses: actions/upload-artifact@v3  # 使用 v3 版本
+        with:
+          name: wsl2-waydroid-kernel
+          path: WSL2-Linux-Kernel/arch/x86/boot/bzImage
+          retention-days: 7  # 文件保存7天，足够下载
