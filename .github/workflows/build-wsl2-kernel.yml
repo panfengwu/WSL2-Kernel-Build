@@ -17,10 +17,11 @@ jobs:
           git clone --depth=1 -b linux-msft-wsl-6.6.y https://github.com/microsoft/WSL2-Linux-Kernel.git
           cd WSL2-Linux-Kernel
 
-      - name: Build Kernel (Enable Binder)
-        run: |
-          cd WSL2-Linux-Kernel
-          make -j$(nproc) KCONFIG_CONFIG=microsoft/config-wsl bzImage  # 自动启用binder模块
+    - name: Build Kernel (Enable Binder)
+      run: |
+      cd WSL2-Linux-Kernel
+      make -j$(nproc) KCONFIG_CONFIG=Microsoft/config-wsl bzImage  # 这里把microsoft改成Microsoft
+          
 
       - name: Upload Compiled Kernel
         uses: actions/upload-artifact@v4
